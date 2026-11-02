@@ -87,3 +87,10 @@ async def test_idempotency_key(client):
     a = (await client.post("/async", json=body, headers={"Idempotency-Key": "k1"})).json()
     b = (await client.post("/async", json=body, headers={"Idempotency-Key": "k1"})).json()
     assert a["request_id"] == b["request_id"] and b["duplicate"]
+
+
+async def test_idempotency_key_concurrent(client):
+    body = {"text": "x", "rounds": 1, "callback_url": "http://127.0.0.1:1/cb"}
+    rs = await asyncio.gather(*(client.post("/async", json=body, headers={"Idempotency-Key": "k2"}) for _ in range(10)))
+    assert all(r.status_code in (200, 202) for r in rs)
+    assert len({r.json()["request_id"] for r in rs}) == 1

@@ -1,5 +1,17 @@
 # Sync vs Async (Callback) API under request storms
 
+**Submitted by:** Kunal Madan  |  **Stack:** Python 3.12, FastAPI, SQLite (WAL), httpx  |  **Tests:** 11 passing  |  **Demo:** _Loom link_
+
+| Assignment requirement | Where it is handled |
+| --- | --- |
+| Same work behind both endpoints | `app/work.py`, called by `/sync` and by the async worker |
+| Query recent requests, trace async delivery | `GET /requests`, `GET /requests/{id}` (status timeline + every callback attempt) |
+| Callback URL is down | Retries with backoff and jitter, permanent-failure detection, terminal `failed` status |
+| Ordering and timing | FIFO queue, monotonic `seq` on every callback, jobs persisted before ack and recovered on restart |
+| High request volume | Bounded queue (429), sync concurrency cap (503), per-IP rate limit, size limits |
+| Callback abuse | SSRF guard, no redirects, host allowlist, HMAC-signed callbacks, idempotency keys |
+| Load generator | `loadgen.py` with its own callback receiver and failure injection |
+
 A FastAPI service that exposes the same deterministic work in two interaction styles, plus a load generator that compares them.
 
 - `POST /sync` does the work and returns the result in the response.
@@ -22,7 +34,7 @@ curl -s localhost:8000/requests/<id>     # full trace, including every callback 
 curl -s localhost:8000/healthz
 ```
 
-Tests: `pytest -q`
+Tests: `pytest -q` (11 tests)
 
 ## Load generator
 
@@ -89,7 +101,44 @@ POST /async -> validate URL -> persist (queued) -> bounded asyncio.Queue -> 202
 
 ### Trade-offs and next steps
 
+The demo deliberately runs as a single process. These are the next steps for production:
+
 - **Single process, in-memory queue.** To scale horizontally, replace it with Redis Streams, SQS or Kafka, and Postgres instead of SQLite. The queue and rate limiter are the only pieces that hold in-process state.
 - **Write cost.** SQLite commits every state change on a single connection. That is the main source of ack latency under load. Batching writes or switching to Postgres would cut it.
 - **DNS rebinding.** The SSRF check resolves the host once at submit time. A hardened version would pin the resolved IP for the actual connection.
 - **Sync vs async.** Sync is simpler for clients but ties up a connection for the whole job, and its tail latency grows with load. Async acks quickly and absorbs bursts in the queue. In exchange, clients have to run a callback endpoint, handle at-least-once delivery, and deal with possible reordering.
+
+## Technical validation
+
+I checked each guarantee with a test or a measured run, not by reading the code.
+
+| Guarantee | How it was checked |
+| --- | --- |
+| Sync and async run identical logic | Test compares the `/sync` result with the delivered async result |
+| Failed callbacks are retried, then delivered | Test receiver fails twice, then succeeds: attempts recorded as `[500, 500, 200]` |
+| Permanent rejections are not retried | Receiver returns 404: exactly one attempt, status `failed` |
+| Retries hold up under load | `--fail-rate 0.3` on 1000 requests: 997 delivered, 3 failed. Theory predicts 0.3^5 ≈ 0.24%, about 2.4 |
+| No duplicate jobs on client retries | Sequential and 10-way concurrent requests with one `Idempotency-Key` all return the same id |
+| SSRF targets are blocked | Tests reject `ftp://`, embedded credentials, `127.0.0.1`, `10.x`, `169.254.169.254` |
+| No crash under a storm | 4000 mixed requests at concurrency 200: 100% success, queue drained to 0 |
+
+**Testing caught a real bug.** One integration test stayed stuck at `queued`. The job queue was created at import time, so it was tied to a different event loop from the one running the workers. I moved its creation into startup and every test passed. In production this would only appear on a restart within the same process, which makes it the kind of bug that is hard to find later.
+
+## AI and resource usage
+
+- **AI tool: Claude Code.** I used it to scaffold the modules, the load generator and the tests, and to iterate quickly. Claude wrote first drafts; I made the design decisions and reviewed every file.
+- **Decisions I made:**
+  - Persist each job before acknowledging it, so no acknowledged job can be lost.
+  - Split `processing` from `delivering`, so recovery redelivers a stored result instead of recomputing it.
+  - Choose which callback failures are retried and which are permanent, and schedule retries outside the worker pool.
+  - Shed load with explicit limits instead of letting queues grow.
+  - Make ordering best-effort with a `seq` number rather than strict, and document why.
+  - Decide what the callback protections cover.
+- **How I checked the AI output:**
+  - Every guarantee above has a test or a measured run.
+  - I checked the retry results against the probability math, not just the pass count.
+  - I reviewed the concurrency and security paths by hand. That review found the race between two identical idempotency keys, which I fixed and covered with a test.
+- **References:**
+  - AWS Builders Library, "Timeouts, retries, and backoff with jitter"
+  - Stripe docs, Idempotent requests, and Webhook signatures
+  - OWASP, Server-Side Request Forgery Prevention Cheat Sheet

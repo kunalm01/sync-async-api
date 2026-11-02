@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -79,7 +80,12 @@ async def async_endpoint(body: AsyncIn, idempotency_key: str | None = Header(def
     rid = str(uuid.uuid4())
     payload = body.model_dump(exclude={"callback_url"})
     # Persist before enqueue so a crash after ACK never loses the job.
-    seq, created = await db.insert(rid, "async", "queued", payload, callback_url=body.callback_url, idem=idempotency_key)
+    try:
+        seq, created = await db.insert(rid, "async", "queued", payload, callback_url=body.callback_url, idem=idempotency_key)
+    except sqlite3.IntegrityError:
+        # Two concurrent requests with the same key: the unique constraint picks one winner.
+        existing = await db.get_by_idem(idempotency_key)
+        return {"request_id": existing["id"], "status": existing["status"], "duplicate": True}
     dispatcher.submit({"id": rid, "seq": seq, "payload": payload, "callback_url": body.callback_url,
                        "created_at": created, "attempts": 0})
     return {"request_id": rid, "seq": seq, "status": "queued", "status_url": f"/requests/{rid}"}
