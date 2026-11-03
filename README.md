@@ -1,6 +1,6 @@
 # Sync vs Async (Callback) API under request storms
 
-**Submitted by:** Kunal Madan  |  **Stack:** Python 3.12, FastAPI, SQLite (WAL), httpx  |  **Tests:** 11 passing  |  **Demo:** _Loom link_
+**Submitted by:** Kunal Madan  |  **Stack:** Python 3.12, FastAPI, SQLite (WAL), httpx  |  **Tests:** 11 passing  |  **Demo:** [Loom video](https://www.loom.com/share/f5394e04eeff48a8a30130bfda373ef1)
 
 | Assignment requirement | Where it is handled |
 | --- | --- |
